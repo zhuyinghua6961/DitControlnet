@@ -97,6 +97,106 @@ def compute_snr(noise_scheduler, timesteps):
     return snr
 
 
+def verify_step_zero_baseline(controlnet, transformer, vae, text_encoder, noise_scheduler, tokenizer, device, use_controlnet=True):
+    """
+    Step-0 自动化数值验证脚本 (Baseline版本)
+    验证模型初始化是否成功，确保输出正常且不包含 NaN
+    """
+    logger.info("🔍 开始 Step-0 数值验证 (Baseline)...")
+    
+    try:
+        # 创建虚拟输入
+        batch_size = 1
+        height, width = 512, 512
+        
+        # 虚拟噪声图像
+        latents = torch.randn(batch_size, 4, height // 8, width // 8).to(device)
+        
+        # 虚拟时间步
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,)).to(device)
+        
+        # 虚拟文本输入
+        prompt = "a photo of a cat"
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids.to(device)
+        
+        # 虚拟条件图像 (Canny等)
+        conditioning_pixel_values = torch.randn(batch_size, 3, height, width).to(device)
+        
+        # VAE 编码条件图像
+        conditioning_latents = vae.encode(conditioning_pixel_values).latent_dist.sample()
+        conditioning_latents = conditioning_latents * vae.config.scaling_factor
+        
+        # 文本编码
+        with torch.no_grad():
+            prompt_embeds = text_encoder(text_input_ids)[0]
+        
+        # 测试前向传播
+        with torch.no_grad():
+            if use_controlnet:
+                # ControlNet 前向传播
+                controlnet_output = controlnet(
+                    latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs={"image_embeds": None},
+                    conditioning_pixel_values=conditioning_pixel_values,
+                )
+                
+                # 检查 ControlNet 输出
+                if isinstance(controlnet_output, tuple):
+                    down_block_res_samples, mid_block_res_sample = controlnet_output
+                    if torch.isnan(down_block_res_samples).any() or torch.isnan(mid_block_res_sample).any():
+                        raise AssertionError("ControlNet 输出包含 NaN")
+                else:
+                    if torch.isnan(controlnet_output).any():
+                        raise AssertionError("ControlNet 输出包含 NaN")
+                        
+                # 使用 ControlNet 输出进行 transformer 前向传播
+                noise_pred = transformer(
+                    latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs={"image_embeds": None},
+                    down_block_additional_residuals=controlnet_output[0] if isinstance(controlnet_output, tuple) else None,
+                    mid_block_additional_residual=controlnet_output[1] if isinstance(controlnet_output, tuple) else None,
+                ).sample
+            else:
+                # Baseline 前向传播
+                noise_pred = transformer(
+                    latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs={"image_embeds": None},
+                ).sample
+            
+        # 验证输出
+        if torch.isnan(noise_pred).any():
+            raise AssertionError("Transformer 输出包含 NaN")
+            
+        # 检查输出范围
+        output_mean = noise_pred.abs().mean().item()
+        output_std = noise_pred.std().item()
+        
+        if output_mean > 10.0 or output_std > 5.0:
+            logger.warning(f"⚠️  输出数值较大：mean={output_mean:.4f}, std={output_std:.4f}")
+        else:
+            logger.info(f"✅ 输出数值正常：mean={output_mean:.4f}, std={output_std:.4f}")
+            
+        logger.info("✅ Step-0 数值验证通过 (Baseline)：模型输出正常")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Step-0 验证失败 (Baseline)：{str(e)}")
+        return False
+
+
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Baseline ControlNet Training for PixArt-alpha-XL-2")
     parser.add_argument(
@@ -431,6 +531,16 @@ def main(args):
     if args.gradient_checkpointing:
         controlnet.enable_gradient_checkpointing()
         transformer.enable_gradient_checkpointing()
+
+    # Step-0 数值验证
+    if accelerator.is_main_process:
+        if not verify_step_zero_baseline(
+            controlnet, transformer, vae, text_encoder, 
+            noise_scheduler, tokenizer, accelerator.device, 
+            use_controlnet=args.use_controlnet
+        ):
+            logger.error("Step-0 验证失败，退出训练")
+            return
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices

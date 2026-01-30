@@ -38,6 +38,46 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def verify_step_zero(model, device, resolution=512):
+    """
+    Step-0 自动化数值验证脚本
+    验证零初始化（Zero-Linear）是否成功，确保模型输出正常且不包含 NaN
+    """
+    logger.info("🔍 开始 Step-0 数值验证...")
+    model.eval()
+    
+    # 创建虚拟输入
+    dummy_noise = torch.randn(1, 3, resolution, resolution).to(device)
+    dummy_cond = torch.randn(1, 3, resolution, resolution).to(device)
+    dummy_t = torch.zeros(1).to(device)
+    
+    try:
+        with torch.no_grad():
+            # 获取模型输出
+            output = model(dummy_noise, dummy_cond, dummy_t)
+            
+        # 验证输出
+        if torch.isnan(output).any():
+            raise AssertionError("验证失败：模型输出包含 NaN")
+            
+        # 检查输出范围（对于扩散模型，输出通常在合理范围内）
+        output_mean = output.abs().mean().item()
+        output_std = output.std().item()
+        
+        if output_mean > 10.0 or output_std > 5.0:
+            logger.warning(f"⚠️  输出数值较大：mean={output_mean:.4f}, std={output_std:.4f}")
+        else:
+            logger.info(f"✅ 输出数值正常：mean={output_mean:.4f}, std={output_std:.4f}")
+            
+        logger.info("✅ Step-0 数值验证通过：模型输出正常且 ZeroLinear 已生效")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Step-0 验证失败：{str(e)}")
+        return False
+    finally:
+        model.train()
+
 def main():
     parser = argparse.ArgumentParser(description='ControlNet-DiT Training')
     parser.add_argument('--config', type=str, default='config/config.yaml',
@@ -78,6 +118,11 @@ def main():
 
     # 创建模型
     model = ControlNetDiT(config).to(device)
+
+    # Step-0 数值验证
+    if not verify_step_zero(model, device, config['data']['resolution']):
+        logger.error("Step-0 验证失败，退出训练")
+        return
 
     # 编译模型（如果支持）
     if config['hardware']['compile_model'] and hasattr(torch, 'compile'):

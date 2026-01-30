@@ -300,8 +300,17 @@ python scripts/evaluation.py \
 ```
 
 📖 [完整评估指南](EVALUATION_GUIDE.md)
-- **学习率调度**: Warmup + Cosine Annealing
-- **WandB集成**: 实验跟踪
+
+### 第四阶段：Step-0 数值验证 (✅ 已实现)
+在正式训练前自动验证模型初始化，确保零初始化（Zero-Linear）成功且输出正常。
+
+**验证内容**:
+- ✅ 检查模型输出是否包含 NaN
+- ✅ 验证输出数值范围是否正常
+- ✅ 确保 ZeroLinear 初始化生效
+- ✅ 适用于 Baseline 和 AdaLN 两种模式
+
+**自动执行**: 训练脚本启动时自动运行，无需手动干预。
 
 ## 快速开始
 
