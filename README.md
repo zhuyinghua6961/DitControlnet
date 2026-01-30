@@ -2,6 +2,234 @@
 
 基于 DiT (Diffusion Transformer) 和 ControlNet 的条件图像生成模型，支持 fill50k 数据集的高效训练。
 
+## 网络架构详解
+
+### 整体架构概述
+
+ControlNet-DiT 采用"主干网络 + 控制分支"的双路径架构，结合了 Transformer 的全局建模能力和 ControlNet 的精确控制能力。
+
+```
+输入图像 (噪声)          条件图像 (Canny/Depth等)
+      ↓                           ↓
+ Patch Embed              Condition Encoder
+      ↓                           ↓
+ Position Embed          Feature Extraction
+      ↓                           ↓
+      ├─────────────→  Control Blocks  ───→ Zero Convs
+      ↓                     ↓                    ↓
+ DiT Blocks  ←───────── Residual Injection ─────┘
+      ↓
+ Final Norm
+      ↓
+ Output Proj
+      ↓
+  预测噪声/图像
+```
+
+### 核心模块详解
+
+#### 1. **ConditionEncoder (条件编码器)**
+**作用**: 将条件图像(如 Canny 边缘、深度图)编码为与 Transformer 对齐的特征表示
+
+**结构**:
+```python
+输入: (B, 3, 512, 512) RGB 条件图像
+  ↓
+Conv2d(3→64, stride=2)    # 512 → 256
+  ↓ SiLU
+Conv2d(64→128, stride=2)  # 256 → 128
+  ↓ SiLU
+Conv2d(128→256, stride=2) # 128 → 64
+  ↓ SiLU
+Conv2d(256→1152, stride=1) # 特征映射到 hidden_size
+  ↓
+Patch Embed(2x2, stride=2) # 64 → 32 (patchify)
+  ↓
+输出: (B, 1024, 1152) # 1024 个 token，每个维度 1152
+```
+
+**关键特性**:
+- 3 次下采样卷积将空间分辨率从 512 降至 64
+- 最终 patch embed 将特征图转为 token 序列
+- 输出维度与主 Transformer 的 hidden_size 对齐
+
+#### 2. **DiTBlock (DiT Transformer 块)**
+**作用**: 基于 Adaptive Layer Normalization (AdaLN) 的 Transformer 块，实现条件注入
+
+**结构**:
+```python
+输入: x (B, N, D), c (B, D) 条件嵌入
+  ↓
+AdaLN Modulation → (shift_msa, scale_msa, gate_msa, 
+                     shift_mlp, scale_mlp, gate_mlp)
+  ↓
+┌─────────────────────────────────┐
+│ Self-Attention 分支:             │
+│   LayerNorm(x)                  │
+│   → AdaLN(shift, scale)         │
+│   → MultiheadAttention          │
+│   → Gate(gate_msa)              │
+│   → Residual Add                │
+└─────────────────────────────────┘
+  ↓
+┌─────────────────────────────────┐
+│ MLP 分支:                        │
+│   LayerNorm(x)                  │
+│   → AdaLN(shift, scale)         │
+│   → Linear→GELU→Linear          │
+│   → Gate(gate_mlp)              │
+│   → Residual Add                │
+└─────────────────────────────────┘
+  ↓
+输出: (B, N, D)
+```
+
+**关键特性**:
+- **AdaLN (Adaptive Layer Normalization)**: 通过仿射变换 `scale` 和 `shift` 注入时间步和条件信息
+- **门控机制 (Gating)**: 通过 `gate` 参数控制每个分支的贡献
+- **MLP 扩展比例**: 默认 4.0，即隐藏层维度是输入的 4 倍
+
+#### 3. **ControlNet 分支**
+**作用**: 克隆主 Transformer 的前 N 个块，构建独立的控制路径
+
+**结构**:
+```python
+n_control_blocks = 14  # 通常使用前 14 层
+
+控制分支:
+  条件特征 + 主干隐藏状态
+    ↓
+  Cloned Block 1 → Zero Linear 1 → Residual 1
+    ↓
+  Cloned Block 2 → Zero Linear 2 → Residual 2
+    ↓
+    ...
+    ↓
+  Cloned Block 14 → Zero Linear 14 → Residual 14
+    ↓
+  注入到主干对应层
+```
+
+**关键特性**:
+- **零初始化线性层 (ZeroLinear)**: 
+  - 训练初期不影响主网络，保证稳定性
+  - 权重和偏置初始化为 0
+  - 随训练逐步学习控制信号
+  
+- **逐块残差注入**: 
+  - 每个控制块的输出通过 Zero Linear 后注入主干
+  - 保持细粒度的空间控制能力
+
+#### 4. **完整 ControlNetDiT 模型**
+
+**主要组件**:
+
+| 组件 | 输入 | 输出 | 作用 |
+|------|------|------|------|
+| `patch_embed` | (B, C, H, W) | (B, N, D) | 将图像分割为 patch 序列 |
+| `pos_embed` | - | (1, N, D) | 可学习的位置编码 |
+| `control_embed` | (B, C, H, W) | (B, N, D) | 条件图像的 patch 嵌入 |
+| `time_embed` | (B,) | (B, D) | 时间步的正弦位置编码 |
+| `blocks` | (B, N, D) | (B, N, D) | 主 Transformer 块序列 |
+| `norm` | (B, N, D) | (B, N, D) | 输出前的 LayerNorm |
+| `final_proj` | (B, N, D) | (B, N, C×P²) | 投影回图像空间 |
+
+**前向传播流程**:
+```python
+1. 输入处理:
+   x_patches = patch_embed(噪声图像) + pos_embed
+   cond_patches = control_embed(条件图像)
+   
+2. 时间和条件嵌入:
+   t_embed = time_embed(timestep)
+   c_embed = t_embed + mean(cond_patches)  # 全局条件
+   
+3. Transformer 处理:
+   for block in blocks:
+       x_patches = block(x_patches, c_embed)
+   
+4. 输出投影:
+   x_patches = norm(x_patches)
+   x_patches = final_proj(x_patches)
+   x_out = rearrange(x_patches) → (B, C, H, W)
+```
+
+### 扩散过程详解
+
+#### 时间步编码 (Timestep Embedding)
+```python
+def timestep_embedding(t, dim):
+    """正弦位置编码"""
+    half_dim = dim // 2
+    emb = log(10000) / (half_dim - 1)
+    emb = exp(arange(half_dim) * -emb)
+    emb = t[:, None] * emb[None, :]
+    emb = concat([sin(emb), cos(emb)], dim=-1)
+    return emb  # (B, dim)
+```
+
+**作用**: 将离散时间步 t ∈ [0, 1000] 编码为连续向量表示
+
+#### 扩散调度 (Diffusion Schedule)
+
+支持两种调度类型:
+
+**1. Linear Schedule**:
+```python
+β_t = linear_interp(β_start, β_end, t/T)
+α_t = 1 - β_t
+ᾱ_t = ∏(α_s) for s=1 to t
+```
+
+**2. Cosine Schedule**:
+```python
+ᾱ_t = cos²((t/T + s)/(1+s) × π/2)
+β_t = 1 - (ᾱ_t / ᾱ_{t-1})
+```
+
+**关键参数**:
+- `num_timesteps`: 1000 (总扩散步数)
+- `beta_start`: 0.0001 (噪声起始强度)
+- `beta_end`: 0.02 (噪声结束强度)
+
+### 损失函数
+
+支持多种损失类型:
+
+| 损失类型 | 公式 | 适用场景 |
+|---------|------|---------|
+| MSE | `L = mean((pred - target)²)` | 标准扩散模型 |
+| L1 | `L = mean(|pred - target|)` | 对异常值更鲁棒 |
+| Huber | `L = smoothL1(pred, target)` | 结合 L1 和 L2 优势 |
+
+### 训练策略
+
+#### 数据增强
+```python
+# 空间对齐增强 (条件和目标同步变换)
+- 随机水平翻转 (p=0.5)
+- 随机垂直翻转 (p=0.5)
+
+# 异构插值
+- 目标图像: Bilinear (平滑)
+- 条件图像: Nearest (保持边缘锐利)
+```
+
+#### 优化器配置
+```yaml
+optimizer: AdamW
+learning_rate: 1e-5  # 微调推荐更小 LR
+weight_decay: 0.01
+gradient_clip_norm: 1.0
+warmup_steps: 1000
+```
+
+#### 内存优化
+- **梯度检查点**: 减少 ~40% 显存
+- **混合精度 (bf16/fp16)**: 加速 ~2x
+- **梯度累积**: 模拟大 batch size
+- **8-bit AdamW**: 节省优化器显存
+
 ## 项目结构
 
 ```

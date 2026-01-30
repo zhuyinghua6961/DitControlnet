@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.tar.gz
 # Distribution / packaging
 .Python
 build/
@@ -140,6 +140,7 @@ wandb/
 # Data (if not committed)
 data/
 dataset/
+!dataset/*.py
 *.jsonl
 *.csv
 
