@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+dataset_fill50k/
 # C extensions
 *.so
 *.tar.gz
@@ -136,7 +137,7 @@ output/
 training.log
 tensorboard/
 wandb/
-
+dataset_cocostuff/
 # Data (if not committed)
 data/
 dataset/
