@@ -1,0 +1,43 @@
+{
+  "test": "data/manifests/test_manifest_10.jsonl",
+  "model_id": "PixArt-alpha/PixArt-XL-2-512x512",
+  "model_cache": "/mnt/fast18/models_cache",
+  "offline": true,
+
+  "lora": "outputs/pixart_lora_baseline_10k/best",
+  "output_dir": "outputs/pixart_lora_eval_10k",
+  "output_jsonl": "outputs/pixart_lora_eval_10k/eval_test_detailed.jsonl",
+  "summary_json": "outputs/pixart_lora_eval_10k/eval_test_summary.json",
+  "save_images": true,
+  "image_dir": "outputs/pixart_lora_eval_10k/images",
+  "self_check": false,
+  "self_check_samples": 1,
+  "self_check_save": false,
+  "sanity_check": true,
+  "vae_fp32": true,
+  "force_fp32": true,
+  "generate_only": false,
+  "eval_only": false,
+
+  "height": 512,
+  "width": 512,
+  "num_steps": 30,
+  "guidance_scale": 4.5,
+  "seed": 42,
+  "per_sample_seed": true,
+  "scheduler": "dpmpp_2m_karras",
+  "mixed_precision": "fp16",
+
+  "eval_size": 256,
+  "clip_model": "openai/clip-vit-base-patch16",
+  "clip_device": "cuda",
+  "dino_model": "facebook/dinov2-base",
+  "dino_device": "cuda",
+  "lpips_net": "alex",
+  "lpips_device": "cuda",
+  "prompt_fallback": "a stylized image",
+
+  "gc_interval": 20,
+  "empty_cache_interval": 20,
+  "no_tqdm": false
+}
